@@ -21,7 +21,7 @@
 # Based on the RasPBX backup utility, version 1.3 by: Gernot Bauer <gernot at raspbx.org>
 #
 # Author: Klaus Gottschalk - klaus at kgem.de
-# $Id: SDbackup 147 2019-11-24 09:31:20Z klaus $
+# $Id: SDbackup 153 2019-11-25 08:04:23Z klaus $
 #
 # This script uses perl modules: 
 #	Getopt::Std, File::Basename, String::ShellQuote
@@ -62,7 +62,7 @@ select (STDERR); $| = 1;
 select (STDOUT); $| = 1;
 
 # define script version
-our $VERSION = '0.5';
+our $VERSION = '0.8';
 
 # script's name and usage
 my $mynm = fileparse ($0,qr/\.[^.]*/);
@@ -110,6 +110,7 @@ my %setup = (
 	ignoreFs =>	['autofs'],
 	resizeFS =>	['ext2','ext3','ext4'],
 	cmds =>		['losetup','mount','umount','sync','sfdisk','mkfs.vfat','mkfs.ext4','resize2fs','fsck.vfat','fsck.ext4','rsync','lsblk','df','truncate'],
+	addPath =>	'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
 );
 
 my $innerScript = 0;
@@ -157,6 +158,7 @@ if ($opt_n and !$opt_M) {
 }
 
 # retrieve for all external commands the full path
+$ENV{PATH} .= $setup{addPath} if (defined $setup{addPath});
 my %path = ();
 foreach my $cmd (@{$setup{cmds}}) {
 	$path{$cmd} = which($cmd);
@@ -247,7 +249,7 @@ if ($opt_c) {
 	#
 	# write image file with \0
 	printf "Total image size will be %.1fGB ($imgSzB blocks).\n",$imgSzB/2097152 if ($opt_v);
-	print "Creating empty image ".shell_quote($image).". This will take a while ... " unless ($opt_q);
+	print "Creating new image ".shell_quote($image).". This will take a while ... " unless ($opt_q);
 	my $stm = time();
 	writeZero ($image,$imgSzB,0);
 	printf "done (%.1fMB/s).\n",$imgSzB/(time()-$stm)/2048 unless ($opt_q);
@@ -258,7 +260,7 @@ if ($opt_c) {
 }
 
 # get current partition table from image file
-my %ipt = getPt($image);
+my %ipt = getPt ($image);
 
 # get root partition size of image
 my ($dev,$startB,$sizeB) = split (/:/,$ipt{table}[idx($rdev,@{$pt{table}})]);
@@ -284,7 +286,7 @@ if ($opt_r and !$opt_c) {
 }
 
 # install signal handler for CTRL-C
-$SIG{INT} = sub {die "$mynm: Caught SIG@_[0]. $mynm exit.\n" };
+$SIG{INT} = sub {die "\n$mynm: Caught SIG@_[0]. $mynm exit.\n" };
 $innerScript = 1;
 
 # get next free loop device
@@ -293,7 +295,6 @@ die "$! $mynm exit.\n" if ($?);
 
 # setup loop device for root partion
 print "Defining device $lrdevr for '/' (root) file system.\n" if ($opt_v);
-# runCmd ("$path{'losetup'} -o ".($startB*512)." --sizelimit ".($sizeB*512)." $lrdevr ".shell_quote($image)) == 0 or die "$mynm exit.\n";
 runCmd ("$path{'losetup'} -o ".($startB*512)." $lrdevr ".shell_quote($image)) == 0 or die "$mynm exit.\n";
 
 # ensure that root mount point exists
@@ -309,6 +310,7 @@ if ($opt_r and !$opt_c and ($tszB < $sizeB)) {
 	my $useB = (getMpt($setup{mtPoint}))[2];
 
 	# unmount / (root) file system
+	system ($path{'sync'});
 	runCmd ("$path{'umount'} ".shell_quote($setup{mtPoint})) == 0 or die "$mynm exit.\n";
 
 	# require +5% free space after resizing
@@ -442,7 +444,6 @@ if ($opt_M) {
 	exit 0;
 }
 
-
 # sync root file system
 # build exclude directory list
 my $excludeDirs = '--exclude '.shell_quote('/tmp').' --exclude '.shell_quote('lost+found');
@@ -451,15 +452,19 @@ foreach my $dir (@{$setup{exclRootDirs}}) {
 }
 
 print "Synchronzing new/changed files. This will take a while: " unless ($opt_q);
-print "/(root) ... " if ($opt_v and !$opt_q);
+print "/(root) " if ($opt_v and !$opt_q);
 my $cmd = "$path{'rsync'} -axDH ".($opt_d?'-v':'')." --partial --numeric-ids --delete --force $excludeDirs / ".shell_quote($setup{mtPoint});
+my $stime = time();
 runCmd ($cmd) == 0 or die "$mynm exit.\n";
+printf "[%ds] ",time()-$stime if ($opt_v and !$opt_q);
 
 # rsync other file systems
 foreach my $fs (spList (1,@loops)) {
-	print "$fs ... " if ($opt_v and !$opt_d);
+	print "$fs " if ($opt_v and !$opt_d);
 	$cmd = "$path{'rsync'} -axDH ".($opt_d?'-v':'')." --partial --numeric-ids --delete --force ".shell_quote($fs)." ".shell_quote($setup{mtPoint}.(dirname($fs) ne '/'?dirname($fs):''));	
+	$stime = time();
 	runCmd ($cmd) == 0 or die "$mynm exit.\n";
+	printf "[%ds] ",time()-$stime if ($opt_v and !$opt_q);
 }
 print "done.\n" unless ($opt_q and !$opt_d);
 
