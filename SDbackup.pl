@@ -1,0 +1,706 @@
+#!/usr/bin/env perl
+# --------------------------------
+# This is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This file is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# Description:
+# Backup a SD based system to a image file. The SD card must have at least 2 partition
+# root / and /boot. Nested mounts of file systems are not supported. All file systems
+# must be mounted within the root / file system.
+# The image file must reside not reside on the SD card. Use another mounted file system
+# to storge the image file. This can be an network file system.
+# Script needs to run as root user.
+#
+# Based on the RasPBX backup utility, version 1.3 by: Gernot Bauer <gernot at raspbx.org>
+#
+# Author: Klaus Gottschalk - klaus at kgem.de
+# $Id: SDbackup.pl 225 2021-01-17 17:00:43Z klaus $
+#
+# This script uses external Linux commands: 
+#	losetup, mount, umount, sync, sfdisk, mkfs.vfat, mkfs.ext4, resize2fs, fsck.ext4, fsck.fat, rsync
+#	lsblk, df, truncate, hostname
+#
+# On Debian/Ubuntu these command can be installed with:
+#	sudo apt install mount coreutils util-linux dosfstools e2fsprogs rsync
+#
+# And perl modules:
+#	Sys::Hostname;
+#	Getopt::Std;
+#	File::Basename;
+#	String::ShellQuote;
+#
+# On Debian/Ubuntu these command can be installed with:
+#	sudo apt install perl-base libperl libstring-shellquote-perl
+#
+# --------------------------------
+
+# external modules
+use Sys::Hostname;
+use Getopt::Std;
+use File::Basename;
+use String::ShellQuote;
+use Cwd 'abs_path';
+
+# pragmas
+use English;	# use $UID instead on $<
+use strict;	# strict syntax checking
+
+# unbuffered STDOUT & STDERR
+select (STDERR); $| = 1;
+select (STDOUT); $| = 1;
+
+# define script version
+our $VERSION = '0.81';
+
+# script's name and usage
+my $mynm = fileparse ($0,qr/\.[^.]*/);
+my $usage = <<__USAGE__;
+
+Usage:	$mynm [-c|-s] [-d] [-q] [-m] [-M [-n]] [-r] [-s] [-v] [-V] <path to disk image>
+
+Create or synchronize an image file from the local SD card (or disk). The image file is intended
+as a backup of the SD card. It can be written back to an SD card and will boot the system in the
+state from the last image file synchronization.
+
+Options:
+	-c	Create new image file. Fail if file exists. After the image is created,
+		the initial synchronization is done.
+
+	-d	Debug output. Lists executed command and syncronized files.
+
+	-m	Mount and unmount file system, the image resides on.
+		File system should be defined in /etc/fstab.
+
+	-M	Maintenance mode. Mount file systems and exit.
+
+	-n	Modifier to -M. Don't flag loop devices as autoclear 
+
+	-r	Resize / root partition in the image to current disk usage + %d%% free space.
+		Resizing is only supported with ext2, ext3 and ext4 file systems.
+
+	-s	Synronize existing image with local drive. Fail if image does not exist.
+
+	-q	Quite modus. Don't write output except for errors and warnings.
+
+	-v	Verbose output. Shows all steps of the process to synchronize the image.
+
+	-V	Display script version and exit.
+
+__USAGE__
+
+# SETUP SECTION
+my %setup = (
+	pctFree =>	20,	# 20% 
+	mtPoint =>	"/mnt/$mynm",
+	mkRootDirs =>	['/dev','/media','/mnt','/proc','/run','/sys','/tmp'],
+	exclRootDirs =>	[],
+	netFs =>	['nfs','nfs3','nfs4','smb'],
+	ignoreFs =>	['autofs'],
+	resizeFS =>	['ext2','ext3','ext4'],
+	cmds =>		['losetup','mount','umount','sync','sfdisk','mkfs.vfat','mkfs.ext4','resize2fs','fsck.vfat','fsck.ext4','rsync','lsblk','df','truncate'],
+	addPath =>	'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+);
+
+my $innerScript = 0;
+
+# retrieve command line options
+our ($opt_c,$opt_s,$opt_d,$opt_m,$opt_M,$opt_n,$opt_r,$opt_q,$opt_v,$opt_V);
+getopts ("csdmMnrsqvV") or die sprintf $usage,$setup{pctFree}*100;
+
+# show version and exit
+if ($opt_V) {
+	print "$mynm v$VERSION\n";
+	exit (0);
+}
+
+# show usage if no command
+($#ARGV == 0) or die sprintf $usage,$setup{pctFree}*100;
+
+# UID 0 (root) required
+if ($UID != 0) {
+	die "\n$mynm: Error - command needs to run as root user.\n\n";
+}
+
+# report start time if -v
+print "$mynm started on ".hostname()." at ".localtime ().".\n" if ($opt_v);
+
+# check if either -c or -s was sepcified
+unless ($opt_c or $opt_s or $opt_M) {
+	print STDERR "\n$mynm: Error - either option -s or -c is needed.\n";
+	die sprintf $usage,$setup{pctFree}*100;
+}
+# check if both -s and -c are specified
+if ($opt_c and $opt_s) {
+	print STDERR "\n$mynm: Error - options -c and -s are exclusive.\n";
+	die sprintf $usage,$setup{pctFree}*100;
+}
+# check if both -d and -q are specified
+if ($opt_v and $opt_q) {
+	print STDERR "\n$mynm: Error - options -d and -q are exclusive.\n";
+	die sprintf $usage,$setup{pctFree}*100;
+}
+#
+if ($opt_n and !$opt_M) {
+	print STDERR "\n$mynm: Error - option -n requires -m.\n";
+	die sprintf $usage,$setup{pctFree}*100;
+}
+
+# retrieve for all external commands the full path
+$ENV{PATH} .= $setup{addPath} if (defined $setup{addPath});
+my %path = ();
+foreach my $cmd (@{$setup{cmds}}) {
+	$path{$cmd} = which($cmd);
+	if ($cmd eq 'mkfs.vfat' and !$path{$cmd}) {
+		 $path{$cmd} = which('mkfs.fat');
+	}
+	if ($cmd eq 'fsck.vfat' and !$path{$cmd}) {
+		 $path{$cmd} = which('fsck.fat');
+	}
+	unless ($path{$cmd}) {
+		die "$mynm: Command $cmd not found. Cannot continue.\n";
+	}
+}
+
+my ($img,$idir) = fileparse ($ARGV[0]);
+my $image = "$idir$img";
+
+die "$mynm: Directory $idir does not exist.\n$mynm exit.\n" unless (-d $idir);
+
+if ($opt_m) {
+	print "Mounting file system $idir.\n" if ($opt_v);
+	runCmd("$path{'mount'} $idir") == 0 or die "$mynm exit\n.";
+}
+
+if ($opt_v) {
+	if ($opt_s) {
+		print "Synchronizing with ";
+	} else {
+		print "Creating new ";
+	}
+	print "image file ".shell_quote ($image).".\n";
+}
+
+# identify root file system and drive it's resident on
+my $rdev = getFs ('/');
+my $drv = getPdev ($rdev);
+print "Disk root file system resides on ".shell_quote ($drv).".\n" if ($opt_v);
+
+# read partition table and check number of partitions
+my %pt = getPt ($drv);
+die "$mynm: Only disks with at least 2 partitions are supported.\n" if (@{$pt{table}} < 2);
+
+# disable resizing of / -r if there are more than 2 partitions
+if (@{$pt{table}} > 2 and $opt_r) {
+	print "Resizing of root partition is only supported with two partitions. Disabling -r.\n";
+	$opt_r = 0;
+}
+
+# identify drive where the image file will be written to and check if it's different to root drive
+# get mount point and fs type
+my ($imFs,$fstype) =  getFs (scalar(getMpt($idir)));
+my $imDrv;
+
+# lookup if $fstype is a network file system
+if (grep(/^${fstype}$/,@{$setup{netFs}})) {
+	print "Image file will be written to $fstype drive '$imFs'.\n" if ($opt_v);
+} else {
+	$imDrv =  getPdev ($imFs);
+	die "$mynm: Image file cannot written to same drive ".shell_quote($drv).".\n" if ($drv eq $imDrv and !$opt_r);
+	print "Image file will be written to local drive ".shell_quote($imDrv).".\n" if ($opt_v);
+}
+
+# sanity checks
+if ($opt_c and -f $image) {
+	die "$mynm: Image file ".shell_quote($image)." already exists.\n";
+}
+if ($opt_s and ! -f $image) {
+	die "$mynm: Image file ".shell_quote($image)." does not exists.\n";
+}
+
+
+my ($dev,$szB,$useB) = getMpt('/');
+# if image exists and resides on the same drive, then substract image size from $useB
+$useB -= (stat($image))[12] if (!$opt_c and $drv eq $imDrv);
+printf "Root partition size is %.1fGB ($szB blocks) of which %.1fGB ($useB blocks) are in use.\n",$szB/2097152,$useB/2097152 if ($opt_v);
+
+# if -r then calculate the size of the new root partition in blocks
+my $tszB = 0; my $LszB = 0; my $HszB = 0;
+if ($opt_r) {
+	# calculate root partition target size for image and low and high water mark in blocks
+	my $delta = int($useB*$setup{pctFree}/(100-$setup{pctFree}) + 0.5); # int(x+0.5) = round(x)
+	$tszB = $useB + $delta;
+	$HszB = $tszB + int(0.5*$delta + 0.5); # $useB + round($delta/2)
+	$LszB = $tszB - int(0.5*$delta + 0.5); # $useB - round($delta/2)
+}
+
+# create new image
+if ($opt_c) {
+	# calculate image size in blocks from last partition
+	my ($dev,$startB,$sizeB) = split(/:/,$pt{table}[@{$pt{table}}-1]);
+	my $imgSzB = $startB + ($opt_r?$tszB:$sizeB); # first block has number 0
+	#
+	# write image file with \0
+	printf "Total image size will be %.1fGB ($imgSzB blocks).\n",$imgSzB/2097152 if ($opt_v);
+	print "Creating new image ".shell_quote($image).". This will take a while ... " unless ($opt_q);
+	my $stm = time();
+	writeZero ($image,$imgSzB,0);
+	printf "done (%.1fMB/s).\n",$imgSzB/(time()-$stm)/2048 unless ($opt_q);
+	#
+	# write partition table to image file
+	print "Partitioning image.\n" unless ($opt_q);
+	putPt ($image,($opt_r ? rszPart($tszB,%pt) : %pt));
+}
+
+# get current partition table from image file
+my %ipt = getPt ($image);
+
+# get root partition size of image
+my ($dev,$startB,$sizeB) = split (/:/,$ipt{table}[idx($rdev,@{$pt{table}})]);
+printf "Image root partition size is %.1fGB ($sizeB blocks).\n",$sizeB/2097152 if ($opt_v);
+
+# adjust root partition size of necessary
+if ($opt_r and !$opt_c) {
+	# unset -r if $LszB <= $sizeB <= $HszB
+	printf "Target size is within [%.1fGB ... %.1fGB].\n",$LszB/2097152,$HszB/2097152 if ($opt_v);
+	if (($LszB <= $sizeB) and ($sizeB <= $HszB)) {
+		print "No size adjustment to image of root partition needed.\n" if ($opt_v);
+		$opt_r = 0;
+	} else {
+		# calculate target image file size
+		my $tiszB = $startB + $tszB;
+		# get actual image file size
+		my $iszB = (stat($image))[12];
+		if ($tiszB > $iszB) {
+			printf "Extending image file by ".($tiszB-$iszB)." blocks to %.1fGB ($tiszB blocks).\n",$tiszB/2097152 if ($opt_v);
+			writeZero ($image,$tiszB-$iszB,1);
+		}
+	}
+}
+
+# install signal handler for CTRL-C
+$SIG{INT} = sub {die "\n$mynm: Caught SIG@_[0]. $mynm exit.\n" };
+$innerScript = 1;
+
+# get next free loop device
+chomp(my $lrdevr = `$path{'losetup'} -f`);
+die "$! $mynm exit.\n" if ($?);
+
+# setup loop device for root partion
+print "Defining device $lrdevr for '/' (root) file system.\n" if ($opt_v);
+runCmd ("$path{'losetup'} -o ".($startB*512)." $lrdevr ".shell_quote($image)) == 0 or die "$mynm exit.\n";
+
+# ensure that root mount point exists
+mkpath($setup{mtPoint}) unless (-d $setup{mtPoint});
+
+# if shrinking, check if there is enough free space in image file
+if ($opt_r and !$opt_c and ($tszB < $sizeB)) {
+	# mount / (root) file system
+	print "Mounting root device $lrdevr on $setup{mtPoint}.\n" if ($opt_v);
+	runCmd ("$path{'mount'} $lrdevr ".shell_quote($setup{mtPoint})) == 0 or die "$mynm exit.\n";
+
+	# get used blocks in root of image file
+	my $useB = (getMpt($setup{mtPoint}))[2];
+
+	# unmount / (root) file system
+	system ($path{'sync'});
+	runCmd ("$path{'umount'} ".shell_quote($setup{mtPoint})) == 0 or die "$mynm exit.\n";
+
+	# require +5% free space after resizing
+	if (1.05*$useB >= $tszB) {
+		printf "Not enough free space to shrink image root file system to %.1fGB ($tszB). Delaying shrink to next run.\n",$tszB/2097152 if ($opt_v);
+		$opt_r = 0;
+	}
+}
+
+# check if we need to resize the root file system
+if ($opt_r and !$opt_c) {
+	# check file system
+	print "Checking image root file system ... " if ($opt_v);
+	runCmd ("$path{'fsck.ext4'} -fy $lrdevr") == 0 or die "\n$mynm exit.\n";;
+	print "it's clean.\n" if ($opt_v);
+
+	# if extending, update partition table with changed root partition size and re-read partition table
+	putPt ($image,rszPart($tszB,%pt)) if ($tszB > $sizeB);
+	runCmd ("$path{'losetup'} -c $lrdevr") == 0 or die "$mynm exit.\n";
+
+	# resize file system - enlarge or shrink
+	printf "Resizing root file system to %.1fGB ($tszB blocks). This will take a while ... ",$tszB/2097152 if ($opt_v);
+	runCmd ("$path{'resize2fs'} -f $lrdevr ${tszB}s") == 0 or die "$mynm exit.\n";
+	printf "done.\n" if ($opt_v);
+
+	# check if we are shrinking the fs and need to shrink the partition
+	if ($tszB < $sizeB) {
+		printf "Trunkating image file to %.1fGB ($tszB blocks)\n",$tszB/2097152 if ($opt_v);
+		runCmd ("$path{'truncate'} -cs -".(($sizeB - $tszB)*512)." ".shell_quote($image)) == 0 or die "$mynm exit.\n";
+	
+		# update partition table with changed root partition size and re-read partition table
+		putPt ($image,rszPart($tszB,%pt));
+	}
+	runCmd ("$path{'losetup'} -c $lrdevr") == 0 or die "$mynm exit.\n";
+
+	# update superblocks after resizing of partition
+	print "Re-running resize2fs to update image root superblock.\n" if ($opt_v);
+	runCmd ("$path{'resize2fs'} -f $lrdevr") == 0 or die "$mynm exit.\n";
+
+	# recheck file system
+	print "Rechecking root file system ... " if ($opt_v);
+	runCmd ("$path{'fsck.ext4'} -pf $lrdevr") == 0 or die "$mynm exit.\n";
+	print "it's clean.\n" if ($opt_v);
+}
+
+if ($opt_c) {
+	# format root partition with same file system as current root
+	# use df to retrieve root partition format
+	my $fmt = (getFs ('/'))[1];
+	print "Formating $lrdevr as $fmt file system.\n" if ($opt_v);
+	runCmd ($path{"mkfs.$fmt"}." $lrdevr") == 0 or die "$mynm exit.\n";
+}
+
+# mount / root file system
+print "Mounting root device $lrdevr on $setup{mtPoint}.\n" if ($opt_v);
+runCmd ("$path{'mount'} $lrdevr ".shell_quote($setup{mtPoint})) == 0 or die "$mynm exit.\n";
+
+if ($opt_c) {
+	# ensure that necessary directories exist in root of image
+	foreach my $dir (@{$setup{'mkRootDir'}}) {
+		mkdir("$setup{mtPoint}$dir") or die "$mynm: Can't creat directroy $setup{mtPoint}$dir: $!\n";
+	}
+}
+
+# mark loop device $lrdevr as autoclear on free (unmount)
+unless ($opt_n) {	
+	print "Flagging $lrdevr as autoclear on unmount.\n" if ($opt_v);
+	runCmd ("$path{'losetup'} -d $lrdevr") == 0 or die "$mynm exit.\n";
+}
+
+# list of loop devices we use
+my @loops = ();
+
+# mount all the other partitions from disk including /boot
+foreach my $i (0..$#{$ipt{table}}) {
+	# get partition data
+	my ($idev,$startB,$sizeB) = split(/:/,$ipt{table}[$i]);
+
+	# get device of disk partition
+	my $dev = (split(/:/,($pt{table}[$i])))[0];
+
+	# skip root file system - already handled before
+	next if ($rdev eq $dev);
+
+	# get next free loop device
+	chomp(my $lrdev = `$path{'losetup'} -f`);
+	die "$! $mynm exit.\n" if ($?);
+
+	# get mount point within current root
+	my ($mp,$fmt) = findMpt ($dev);
+	unless ($mp) {
+		print "Partition $dev isn't currently mounted. Skipping it.\n";
+		next;
+	}
+
+	# setup loop device for parttion
+	print "Defining device $lrdev for $mp file system.\n" if ($opt_v);
+	runCmd ("$path{'losetup'} -o ".($startB*512)." --sizelimit ".($sizeB*512)." $lrdev ".shell_quote($image)) == 0 or die "$mynm exit.\n";
+
+	# if needed, format file systems in partitions
+	if ($opt_c) {
+		print "Formating $lrdev as $fmt file system.\n" if ($opt_v);
+		runCmd ($path{"mkfs.$fmt"}." $lrdev") == 0 or die "$mynm exit.\n";
+	}
+
+	# ensure that mount point exists
+	mkpath("$setup{mtPoint}$mp") unless (-d "$setup{mtPoint}$mp");
+
+	print "Mounting device $lrdev on $setup{mtPoint}$mp.\n" if ($opt_v);
+	runCmd ("$path{'mount'} $lrdev ".shell_quote($setup{mtPoint}.$mp)) == 0 or die "$mynm exit.\n";
+
+	# mark loop device $lrdev as autoclear on free
+	unless ($opt_n) {
+		print "Flagging $lrdev as autoclear on unmount.\n" if ($opt_v);
+		runCmd ("$path{'losetup'} -d $lrdev") == 0 or die "$mynm exit.\n";
+	}
+	push (@loops,"$lrdev:$mp");
+}
+
+# image file systems are mounted
+if ($opt_M) {
+	$innerScript = 0;
+	# report things to do after finished
+	print "Maintenance mode: All file systems are left mounted. Please execute the following command(s) as root when finished:\n";
+	print "\tumount";
+	foreach my $dir (spList(1,@loops)) {
+		print " ".shell_quote("$setup{mtPoint}$dir");
+	}
+	print " ".shell_quote($setup{mtPoint})."\n";
+	print "\tlosetup -d ".join(" ",spList (0,@loops))." $lrdevr\n" if ($opt_n);
+	exit 0;
+}
+
+# sync root file system
+# build exclude directory list
+my $excludeDirs = '--exclude '.shell_quote('/tmp').' --exclude '.shell_quote('lost+found');
+
+# exclude image file from rsync if we are writing to the same disk
+$excludeDirs .= ' --exclude '.shell_quote(abs_path($image));
+
+foreach my $dir (@{$setup{exclRootDirs}}) {
+	$excludeDirs .= ' --exclude '.shell_quote($dir);
+}
+
+print "Synchronzing new/changed files. This will take a while: " unless ($opt_q);
+print "/(root) " if ($opt_v and !$opt_q);
+my $cmd = "$path{'rsync'} -axDH ".($opt_d?'-v':'')." --partial --numeric-ids --delete --force $excludeDirs / ".shell_quote($setup{mtPoint});
+my $stime = time();
+runCmd ($cmd) == 0 or die "$mynm exit.\n";
+printf "[%ds] ",time()-$stime if ($opt_v and !$opt_q);
+
+# rsync other file systems
+foreach my $fs (spList (1,@loops)) {
+	print "$fs " if ($opt_v and !$opt_d);
+	$cmd = "$path{'rsync'} -axDH ".($opt_d?'-v':'')." --partial --numeric-ids --delete --force ".shell_quote($fs)." ".shell_quote($setup{mtPoint}.(dirname($fs) ne '/'?dirname($fs):''));	
+	$stime = time();
+	runCmd ($cmd) == 0 or die "$mynm exit.\n";
+	printf "[%ds] ",time()-$stime if ($opt_v and !$opt_q);
+}
+print "done.\n" unless ($opt_q and !$opt_d);
+
+# all done
+exit 0;
+
+# --- End of Script ---
+
+# END block: unount file systems on exit
+END {
+	exit (0) unless ($innerScript);
+	print "Syncing and unmounting file systems ... ".($opt_d?"\n":'') if ($opt_v);
+	system ($path{'sync'});
+	my $cmd = "$path{'umount'} ";
+	for my $fs (spList(1,@loops),'') {
+		$cmd .= shell_quote($setup{mtPoint}.$fs)." ";
+	}
+	runCmd ($cmd);
+	system ("$path{'losetup'} -d ".join(' ',(spList (0,@loops),$lrdevr))." 2>&-") unless($opt_M);
+	runCmd ("$path{'umount'} $idir") if ($opt_m);
+	print "done.\n" if ($opt_v);
+	print "$mynm finished on ".hostname()." at ".localtime ().".\n" if ($opt_v);
+};
+
+# --- Subroutines ---
+
+# from a list of ':' seperated elements extract and return list of n-th element
+sub spList ($@) {
+	my ($n,@list) = @_;
+	my @olist = ();
+	foreach my $l (@list) {
+		push(@olist,(split(/:/,$l))[$n]);
+	}
+	return @olist;
+}
+
+# find index of $dev in list
+sub idx ($@) {
+	my ($dev,@pt) = @_;
+	foreach my $i (0..$#pt) {
+		return $i if ($pt[$i] =~ /^$dev:/);
+	}
+	return undef;
+}
+
+# find file system
+# return device and fs type
+sub getFs ($) {
+	my ($fs) = shell_quote(@_);
+	my @out = `$path{'mount'}` or die "$! $mynm exit.\n";
+	foreach my $ln (@out) {
+		# /dev/mmcblk0p2 on / type ext4 (rw,noatime)
+		$ln =~ /^(.+) on (.+) type (\w+)/;
+		next if (grep(/^$3$/,@{$setup{ignoreFs}}));
+		if ($2 eq $fs) {
+			return ($1,$3) if (wantarray);
+			return $1;
+		}
+	}	
+	return undef;
+}
+
+# find mountpoint for a partition
+# return mount point and fs type
+sub findMpt ($) {
+	my ($dev) = shell_quote(@_);
+	my @out = `$path{'mount'}` or die "$! $mynm exit.\n";
+	foreach my $ln (@out) {
+		# /dev/mmcblk0p2 on / type ext4 (rw,noatime)
+		$ln =~ /^(\S+) on (\S+) type (\w+)/;
+		if ($1 eq $dev) {
+			return ($2,$3) if (wantarray);
+			return $2;
+		}
+	}	
+	return undef;
+}
+
+# get parent disk for device
+# return device name of parent disk
+sub getPdev ($) {
+	my ($p) = @_;
+	chomp(my $pdev = `$path{'lsblk'} -no pkname $p`);
+	die "$! $mynm exit.\n" if ($?);
+	if (-e "/dev/$pdev") {
+		return "/dev/$pdev";
+	}
+	return undef;
+}
+
+# get mount point for file or directory
+# return mountpoint, size and used space in 512byte blocks
+# $ df -k /tmp/tmux-1026/default
+# Filesystem     1k-blocks         Used   Available Use% Mounted on
+# /dev/root      15389966336 3380449280 11351220224  23% /
+sub getMpt($) {
+	my ($f) = shell_quote(@_);
+	chomp(my @out = `$path{'df'} -k $f`);
+	die "$! $mynm exit.\n" if ($?);
+	my ($dev,$size,$used,$free,$pct,$mpt) = split(/\s+/,$out[1]);
+	# multiply by 2 to get 512b blocks
+	$size *= 2; $used *= 2;
+	return($mpt,$size,$used) if (wantarray);
+	return ($mpt);
+}
+
+# read partition table of a disk (image)
+# return disk descriptor
+sub getPt($) {
+	my ($p) = shell_quote(@_);
+	my %pd = ();
+	chomp(my @out = `$path{'sfdisk'} -d $p`);
+	die "$! $mynm exit.\n" if ($?);
+	foreach my $ln (@out) {
+		# ignore empty lines
+		next unless ($ln);
+
+		# read global info lines:
+		# label: dos
+		# label-id: 0x35786a18
+		# device: /dev/sda
+		# unit: sectors
+		if ($ln =~ /^([\w-]+):\s+(\S+)/) {
+			$pd{$1} = $2;
+			next;
+		}
+
+		# read partition info list
+		# /dev/sda1 : start=        8192, size=      524290, type=c
+		# /dev/sda2 : start=      532482, size=     1515518, type=83
+		if ($ln =~ /^(.+) : start=\s+(\d+), size=\s+(\d+), type=\s*(\w+)/) {
+			# ignore entry if size or type == 0
+			next if ($3 == 0 or $4 eq "0");
+			push(@{$pd{table}}, "$1:$2:$3:$4"); 
+		}
+	}
+	return %pd;
+}
+
+# write partition table to a disk (image)
+# if required resize root partition
+sub putPt ($%) {
+	my ($dev,%pd) = @_;
+
+	open (my $fd,'| '.$path{'sfdisk'}." ".shell_quote($dev).(!$opt_d?' 1>/dev/null':'')) or die "$mynm exit.\n";
+	print "---------\nWriting partition table to $dev:\n" if ($opt_d);
+
+	foreach my $o ('label','label-id','device','unit') {
+		print $fd "$o: $pd{$o}\n";
+		print     "$o: $pd{$o}\n" if ($opt_d);
+	}
+	print $fd "\n";
+	foreach my $p (@{$pd{table}}) {
+		printf $fd "%s : start=%12d, size=%12d, type=%s\n", split(/:/,$p);
+		printf     "%s : start=%12d, size=%12d, type=%s\n", split(/:/,$p) if($opt_d);
+	}
+	print  "---------\n" if ($opt_d);
+	close($fd);
+}
+
+# change size of partition 2 in partition table
+# return changes partition descriptor
+sub rszPart ($%) {
+	my ($nsz,%pd) = @_;
+	my ($dev,$start,$size,$type) = split(/:/,$pd{table}[1]);
+	$pd{table}[1] = join(':',$dev,$start,$nsz,$type);
+	return %pd;
+}
+
+# write $cnt sectors of \0 to $dev
+# if $apnd is true append them
+sub writeZero ($$;$) {
+	my ($dev,$cnt,$append) = @_;
+
+	open(my $fh,($append?'>>':'>'),$dev) or die("$mynm: Can't write to '$dev': $!\n");
+	for (1..$cnt) {
+   		print $fh "\0"x(512) or die("$mynm: Error writing to \"$dev\": $!\n");
+	}
+	close($fh) or die("$mynm: Error writing to \"$dev\": $!\n");
+}
+
+# run a external command and capture STDOUT and STDERR
+# continously print output of command
+sub runCmd ($) {
+	my ($cmd,$otp) = @_;
+	my $out = "---------\nCommand: >$cmd<\n";
+	print "\n---------\nCommand: >$cmd<\n" if ($otp);
+
+	open(my $fh,'-|',"$cmd 2>&1") or die "$mynm: Can't execute >$cmd<: $!\n";
+	# read the output into a string
+	while (!eof($fh)) {
+		my $ln = <$fh>;
+		if ($otp) {
+			print $ln;
+		} else {
+			$out .= $ln;
+		}
+	}
+	close($fh);
+	my $ret = $?>>8;
+	if ($ret or $opt_d) {
+		print $out unless ($otp);
+		print "return code $ret\n---------\n";
+	}
+	return ($ret);
+}
+
+# search for an external path
+# return full path to command
+sub which($) {
+	my ($cmd) = @_;
+
+	foreach my $dir (split(/:/,$ENV{PATH})) {
+		if (-x "$dir/$cmd") {
+			return "$dir/$cmd";
+		}
+	}
+	return undef;
+}
+
+# recursivly create directories
+# die if mkdir fails
+sub mkpath($) {
+	my ($dir) = @_;
+
+	my $path = '';
+
+	foreach my $d (split(/\//,$dir)) {
+		$path .= "/$d";
+		next if (-d $path);
+		print "mkdir ($path)\n" if ($opt_d);
+		mkdir ($path) or die "$mynm: Can't create directory $path: $!\n";
+	}
+}
+
+# --- End of Subroutines ---
