@@ -21,13 +21,7 @@
 # Based on the RasPBX backup utility, version 1.3 by: Gernot Bauer <gernot at raspbx.org>
 #
 # Author: Klaus Gottschalk - klaus at kgem.de
-# $Id: SDbackup 153 2019-11-25 08:04:23Z klaus $
-#
-# This script uses perl modules: 
-#	Getopt::Std, File::Basename, String::ShellQuote
-#
-# On Debian/Ubuntu these modules can be installed with:
-#	sudo apt install  perl-base perl-modules libstring-shellquote-perl
+# $Id: SDbackup.pl 225 2021-01-17 17:00:43Z klaus $
 #
 # This script uses external Linux commands: 
 #	losetup, mount, umount, sync, sfdisk, mkfs.vfat, mkfs.ext4, resize2fs, fsck.ext4, fsck.fat, rsync
@@ -52,6 +46,7 @@ use Sys::Hostname;
 use Getopt::Std;
 use File::Basename;
 use String::ShellQuote;
+use Cwd 'abs_path';
 
 # pragmas
 use English;	# use $UID instead on $<
@@ -62,7 +57,7 @@ select (STDERR); $| = 1;
 select (STDOUT); $| = 1;
 
 # define script version
-our $VERSION = '0.8';
+our $VERSION = '0.81';
 
 # script's name and usage
 my $mynm = fileparse ($0,qr/\.[^.]*/);
@@ -210,13 +205,14 @@ if (@{$pt{table}} > 2 and $opt_r) {
 # identify drive where the image file will be written to and check if it's different to root drive
 # get mount point and fs type
 my ($imFs,$fstype) =  getFs (scalar(getMpt($idir)));
+my $imDrv;
 
 # lookup if $fstype is a network file system
 if (grep(/^${fstype}$/,@{$setup{netFs}})) {
 	print "Image file will be written to $fstype drive '$imFs'.\n" if ($opt_v);
 } else {
-	my $imDrv =  getPdev ($imFs);
-	die "$mynm: Image file cannot written to same drive ".shell_quote($drv).".\n" if ($drv eq $imDrv);
+	$imDrv =  getPdev ($imFs);
+	die "$mynm: Image file cannot written to same drive ".shell_quote($drv).".\n" if ($drv eq $imDrv and !$opt_r);
 	print "Image file will be written to local drive ".shell_quote($imDrv).".\n" if ($opt_v);
 }
 
@@ -228,7 +224,10 @@ if ($opt_s and ! -f $image) {
 	die "$mynm: Image file ".shell_quote($image)." does not exists.\n";
 }
 
+
 my ($dev,$szB,$useB) = getMpt('/');
+# if image exists and resides on the same drive, then substract image size from $useB
+$useB -= (stat($image))[12] if (!$opt_c and $drv eq $imDrv);
 printf "Root partition size is %.1fGB ($szB blocks) of which %.1fGB ($useB blocks) are in use.\n",$szB/2097152,$useB/2097152 if ($opt_v);
 
 # if -r then calculate the size of the new root partition in blocks
@@ -266,12 +265,12 @@ my %ipt = getPt ($image);
 my ($dev,$startB,$sizeB) = split (/:/,$ipt{table}[idx($rdev,@{$pt{table}})]);
 printf "Image root partition size is %.1fGB ($sizeB blocks).\n",$sizeB/2097152 if ($opt_v);
 
-# resize root partition size
+# adjust root partition size of necessary
 if ($opt_r and !$opt_c) {
 	# unset -r if $LszB <= $sizeB <= $HszB
 	printf "Target size is within [%.1fGB ... %.1fGB].\n",$LszB/2097152,$HszB/2097152 if ($opt_v);
 	if (($LszB <= $sizeB) and ($sizeB <= $HszB)) {
-		print "No change to image root partition needed.\n" if ($opt_v);
+		print "No size adjustment to image of root partition needed.\n" if ($opt_v);
 		$opt_r = 0;
 	} else {
 		# calculate target image file size
@@ -377,7 +376,7 @@ if ($opt_c) {
 
 # mark loop device $lrdevr as autoclear on free (unmount)
 unless ($opt_n) {	
-	print "Marking $lrdevr as autoclear on unmount.\n" if ($opt_v);
+	print "Flagging $lrdevr as autoclear on unmount.\n" if ($opt_v);
 	runCmd ("$path{'losetup'} -d $lrdevr") == 0 or die "$mynm exit.\n";
 }
 
@@ -424,7 +423,7 @@ foreach my $i (0..$#{$ipt{table}}) {
 
 	# mark loop device $lrdev as autoclear on free
 	unless ($opt_n) {
-		print "Marking $lrdev as autoclear on unmount.\n" if ($opt_v);
+		print "Flagging $lrdev as autoclear on unmount.\n" if ($opt_v);
 		runCmd ("$path{'losetup'} -d $lrdev") == 0 or die "$mynm exit.\n";
 	}
 	push (@loops,"$lrdev:$mp");
@@ -447,6 +446,10 @@ if ($opt_M) {
 # sync root file system
 # build exclude directory list
 my $excludeDirs = '--exclude '.shell_quote('/tmp').' --exclude '.shell_quote('lost+found');
+
+# exclude image file from rsync if we are writing to the same disk
+$excludeDirs .= ' --exclude '.shell_quote(abs_path($image));
+
 foreach my $dir (@{$setup{exclRootDirs}}) {
 	$excludeDirs .= ' --exclude '.shell_quote($dir);
 }
